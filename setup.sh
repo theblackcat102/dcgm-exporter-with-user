@@ -21,6 +21,10 @@ docker run -d \
   -e PROC_ROOT=/host/proc \
   -e HOSTNAME_OVERRIDE="${HOSTNAME}" \
   -v /proc:/host/proc:ro \
+  -e NVIDIA_VISIBLE_DEVICES=all \
+  -e NVIDIA_DRIVER_CAPABILITIES=utility \
+  -v /etc/nsswitch.conf:/etc/nsswitch.conf:ro \
+  -v /var/lib/sss/pipes:/var/lib/sss/pipes:ro \
   -v /etc/passwd:/etc/passwd:ro \
   --runtime nvidia \
   gpu-process-exporter

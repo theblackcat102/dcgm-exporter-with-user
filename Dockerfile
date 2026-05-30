@@ -8,7 +8,8 @@ LABEL org.opencontainers.image.description="DCGM-compatible per-process/per-user
 # bind-mounted in. We install only the CLI utilities, not the full driver.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        curl \
+        sssd-common \
+	curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
