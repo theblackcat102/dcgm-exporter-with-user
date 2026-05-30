@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Existing dcgm-exporter (GPU-level metrics)
+  - job_name: 'dcgm'
+    static_configs:
+      - targets: ['dcgm-exporter:9400']
+    # Relabel so both exporters share the same gpu/UUID/Hostname labels
+    # and can be JOINed in Grafana via on(gpu, UUID, Hostname).
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'DCGM_FI_.*'
+        action: keep
+
+  # This exporter (per-process/per-user metrics)
+  - job_name: 'gpu-process-exporter'
+    static_configs:
+      - targets: ['gpu-process-exporter:9401']

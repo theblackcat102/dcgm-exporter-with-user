@@ -1,0 +1,8 @@
+# No third-party dependencies required.
+# The exporter uses only Python stdlib:
+#   - http.server  (HTTP endpoint)
+#   - xml.etree.ElementTree  (nvidia-smi XML parsing)
+#   - subprocess  (nvidia-smi invocation)
+#   - threading  (background scrape loop)
+#   - pwd  (UID -> username)
+#   - socket  (hostname)

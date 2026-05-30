@@ -1,0 +1,66 @@
+version: "3.9"
+
+services:
+  # -------------------------------------------------------------------------
+  # gpu-process-exporter
+  # Scrapes nvidia-smi and resolves PIDs to usernames/containers.
+  # Exposes metrics at :9401/metrics in DCGM-compatible Prometheus format.
+  # -------------------------------------------------------------------------
+  gpu-process-exporter:
+    build: .
+    container_name: gpu-process-exporter
+    restart: unless-stopped
+    ports:
+      - "9401:9401"
+    environment:
+      PORT: "9401"
+      SCRAPE_INTERVAL_SEC: "5"
+      CMDLINE_MAX_LEN: "128"
+      PROC_ROOT: "/host/proc"
+      # Inject the real host hostname so Hostname label matches dcgm-exporter.
+      # socket.gethostname() inside a container returns the container ID.
+      HOSTNAME_OVERRIDE: "${HOSTNAME}"
+    # Share the host PID namespace so nvidia-smi inside the container sees
+    # all host processes (without this, <processes> in nvidia-smi XML is empty).
+    pid: "host"
+    volumes:
+      # Mount host /proc so the exporter can resolve PIDs to users/containers.
+      # Read-only for security.
+      - /proc:/host/proc:ro
+      # Mount host /etc/passwd so UID -> username resolution works for host users.
+      - /etc/passwd:/etc/passwd:ro
+    # Needs access to the GPU and to nvidia-smi on the host.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Alternatively, if not using Docker Compose GPU support:
+    # runtime: nvidia
+    network_mode: bridge
+
+  # -------------------------------------------------------------------------
+  # Prometheus (optional — include only if you don't have one already)
+  # -------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    profiles:
+      # Only start prometheus when explicitly requested:
+      #   docker compose --profile monitoring up
+      - monitoring
+
+volumes:
+  prometheus_data:
