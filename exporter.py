@@ -7,8 +7,10 @@ Label schema mirrors dcgm-exporter so both can be scraped together and
 joined in Grafana without extra relabeling.
 """
 
+import functools
 import os
 import pwd
+import re
 import socket
 import subprocess
 import time
@@ -21,12 +23,21 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # Configuration (override via environment variables)
 # ---------------------------------------------------------------------------
-LISTEN_PORT      = int(os.environ.get("PORT", 9401))
-SCRAPE_INTERVAL  = float(os.environ.get("SCRAPE_INTERVAL_SEC", 5))
-CMDLINE_MAX_LEN  = int(os.environ.get("CMDLINE_MAX_LEN", 128))
+LISTEN_PORT             = int(os.environ.get("PORT", 9401))
+SCRAPE_INTERVAL         = float(os.environ.get("SCRAPE_INTERVAL_SEC", 5))
+CMDLINE_MAX_LEN         = int(os.environ.get("CMDLINE_MAX_LEN", 128))
+# Enable the per-GPU memory divergence check. Defaults to true; produces zero
+# log noise at steady state (only logs when proc_sum diverges from GPU total
+# by >5% AND >100 MiB). Set to "false" to disable entirely.
+ENABLE_DIVERGENCE_CHECK = os.environ.get("ENABLE_DIVERGENCE_CHECK", "true").lower() == "true"
 # Path prefix for /proc — override to /host/proc when running in a container
 # with the host PID namespace mounted.
 PROC_ROOT        = os.environ.get("PROC_ROOT", "/proc")
+# In containers, host UIDs are visible via /proc but pwd.getpwuid reads the
+# container's own /etc/passwd → wrong or "unknown" usernames.
+# Fix: set HOST_ETC=/host/etc and bind-mount host /etc read-only alongside
+# PROC_ROOT=/host/proc so UID→name resolution uses the host's passwd database.
+HOST_ETC         = os.environ.get("HOST_ETC", "")
 # Use HOSTNAME_OVERRIDE so the Hostname label matches dcgm-exporter exactly.
 # socket.gethostname() inside Docker returns the container ID, not the real host.
 HOSTNAME         = os.environ.get("HOSTNAME_OVERRIDE") or socket.gethostname()
@@ -60,8 +71,24 @@ def uid_for_pid(pid: int) -> Optional[int]:
     return None
 
 
+@functools.lru_cache(maxsize=None)
 def username_for_uid(uid: int) -> str:
-    """Resolve UID to username; fall back to str(uid)."""
+    """Resolve UID to username; fall back to str(uid).
+
+    Results are cached indefinitely — UIDs→names are static for a running
+    exporter, so the passwd file is scanned at most once per unique UID.
+    When HOST_ETC is set, the host's passwd is parsed directly so that
+    container-namespace UIDs resolve correctly.
+    """
+    if HOST_ETC:
+        try:
+            with open(os.path.join(HOST_ETC, "passwd")) as fh:
+                for line in fh:
+                    parts = line.strip().split(":")
+                    if len(parts) >= 3 and int(parts[2]) == uid:
+                        return parts[0]
+        except (OSError, ValueError):
+            pass
     try:
         return pwd.getpwuid(uid).pw_name
     except KeyError:
@@ -83,20 +110,25 @@ def cmdline_for_pid(pid: int, max_len: int = CMDLINE_MAX_LEN) -> str:
     return cmdline or "unknown"
 
 
+# Matches a 64-char lowercase hex container ID in a cgroup path segment.
+# Handles Docker, containerd/k8s (cri-containerd-<id>.scope), Podman
+# (libpod-<id>.scope), and plain /docker/<id> or /containerd/<id> paths.
+_CONTAINER_ID_RE = re.compile(r'(?:^|[-/])([0-9a-f]{64})(?:\.scope)?$')
+
+
 def container_id_for_pid(pid: int) -> str:
     """
-    Extract a Docker/containerd container ID from /proc/<pid>/cgroup.
-    Returns '' if the process is not inside a container.
+    Extract a container ID from /proc/<pid>/cgroup.
+    Returns the first 12 chars (matching `docker ps` short ID) or '' if the
+    process is not inside a recognised container cgroup.
+
+    Supports cgroup v1 and v2 layouts for Docker, containerd, Podman, and k8s.
     """
     for line in _read_proc_file(pid, "cgroup").splitlines():
-        # cgroup v1: 12:devices:/docker/<64-char-id>
-        # cgroup v2: 0::/system.slice/docker-<64-char-id>.scope
-        parts = line.split("/")
-        for part in reversed(parts):
-            # Docker ID: exactly 64 hex chars  OR  docker-<64hex>.scope
-            candidate = part.replace("docker-", "").replace(".scope", "").strip()
-            if len(candidate) == 64 and all(c in "0123456789abcdef" for c in candidate):
-                return candidate[:12]   # short ID to match `docker ps`
+        for part in reversed(line.split("/")):
+            m = _CONTAINER_ID_RE.search(part)
+            if m:
+                return m.group(1)[:12]
     return ""
 
 
@@ -129,6 +161,50 @@ def run_nvidia_smi_xml() -> Optional[ET.Element]:
         return None
 
 
+def run_nvidia_smi_pmon() -> dict:
+    """
+    Run `nvidia-smi pmon -s u -c 1` and return {(gpu_idx, pid): sm_util_pct}.
+
+    `pmon` emits per-process SM (shader multiprocessor / compute) utilization
+    as an integer 0-100.  Processes with no SM activity report "-"; those are
+    mapped to 0.0.  Returns an empty dict on any failure so callers can safely
+    default to 0 without crashing the scrape.
+
+    pmon column order: gpu  pid  type  sm  mem  enc  dec  command
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "pmon", "-s", "u", "-c", "1"],
+            capture_output=True, text=True, timeout=30
+        )
+        sm_map: dict = {}
+        for line in result.stdout.splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.split()
+            # Need at least: gpu  pid  type  sm
+            if len(parts) < 4:
+                continue
+            try:
+                gpu_idx = int(parts[0])
+                pid     = int(parts[1])
+                sm_val  = parts[3]          # "-" when idle or graphics-only
+                sm_util = float(sm_val) if sm_val not in ("-", "N/A") else 0.0
+                sm_map[(gpu_idx, pid)] = sm_util
+            except (ValueError, IndexError):
+                continue
+        return sm_map
+    except FileNotFoundError:
+        print("[WARN] nvidia-smi pmon not available — DCGM_FI_PROC_SM_UTIL will be 0")
+        return {}
+    except subprocess.TimeoutExpired:
+        print("[WARN] nvidia-smi pmon timed out")
+        return {}
+    except Exception as exc:
+        print(f"[WARN] nvidia-smi pmon failed: {exc}")
+        return {}
+
+
 def _text(element: ET.Element, path: str, default: str = "unknown") -> str:
     node = element.find(path)
     if node is None or node.text is None:
@@ -159,6 +235,9 @@ class GpuSnapshot:
         self.gpus: list[dict] = []
         # List of dicts, one per (gpu, process)
         self.processes: list[dict] = []
+        # GPU-level framebuffer used from the XML — keyed by str(gpu_idx),
+        # same key as labels["gpu"], so _check_divergence comparisons line up.
+        self.gpu_fb_used_mib: dict[str, float] = {}
 
 
 def collect() -> GpuSnapshot:
@@ -169,7 +248,11 @@ def collect() -> GpuSnapshot:
 
     snap.scrape_ok      = True
     snap.driver_version = _text(root, "driver_version")
+    sm_map              = run_nvidia_smi_pmon()
 
+    # gpu_idx from enumerate == NVML enumeration order, which pmon also uses.
+    # Both nvidia-smi -q -x and pmon are NVML-level; CUDA_VISIBLE_DEVICES does not affect them.
+    # UUID would be a more stable join key but pmon does not emit it.
     for gpu_idx, gpu_elem in enumerate(root.findall("gpu")):
         uuid      = _text(gpu_elem, "uuid")
         model     = _text(gpu_elem, "product_name")
@@ -186,6 +269,9 @@ def collect() -> GpuSnapshot:
         }
 
         snap.gpus.append(base_labels)
+        snap.gpu_fb_used_mib[str(gpu_idx)] = _mib_to_float(
+            _text(gpu_elem, "fb_memory_usage/used", "0 MiB")
+        )
 
         # Per-process entries
         for proc_elem in gpu_elem.findall("processes/process_info"):
@@ -214,6 +300,7 @@ def collect() -> GpuSnapshot:
                 "container_id": container_id,
                 "cmdline":      cmdline,
                 "_mem_mib":     mem_used_mib,
+                "_sm_util":     sm_map.get((gpu_idx, pid), 0.0),
             })
 
     return snap
@@ -231,6 +318,12 @@ def _labels_str(labels: dict) -> str:
 
     pairs = ", ".join(f'{k}="{escape(str(v))}"' for k, v in labels.items() if not k.startswith("_"))
     return "{" + pairs + "}"
+
+
+def _proc_numeric_labels(proc: dict) -> dict:
+    """Labels for numeric per-process metrics — omit cmdline to avoid cardinality blowup."""
+    return {k: v for k, v in proc.items()
+            if k != "cmdline" and not k.startswith("_")}
 
 
 def render_metrics(snap: GpuSnapshot) -> str:
@@ -254,7 +347,13 @@ def render_metrics(snap: GpuSnapshot) -> str:
     lines.append("# HELP DCGM_FI_PROC_FB_USED Per-process framebuffer memory used (in MiB).")
     lines.append("# TYPE DCGM_FI_PROC_FB_USED gauge")
     for proc in snap.processes:
-        lines.append(f"DCGM_FI_PROC_FB_USED{_labels_str(proc)} {proc['_mem_mib']}")
+        lines.append(f"DCGM_FI_PROC_FB_USED{_labels_str(_proc_numeric_labels(proc))} {proc['_mem_mib']}")
+    lines.append("")
+
+    lines.append("# HELP DCGM_FI_PROC_SM_UTIL Per-process SM (shader multiprocessor / compute) utilization (%).")
+    lines.append("# TYPE DCGM_FI_PROC_SM_UTIL gauge")
+    for proc in snap.processes:
+        lines.append(f"DCGM_FI_PROC_SM_UTIL{_labels_str(_proc_numeric_labels(proc))} {proc['_sm_util']}")
     lines.append("")
 
     lines.append("# HELP DCGM_FI_PROC_INFO GPU process info. Value is always 1; use labels for attribution.")
@@ -264,13 +363,14 @@ def render_metrics(snap: GpuSnapshot) -> str:
     lines.append("")
 
     # --- Per-user aggregated metrics ---
-    # Aggregate: (gpu labels) + username -> total mem, process count
-    user_agg: dict[tuple, dict] = defaultdict(lambda: {"mem": 0.0, "count": 0})
+    # Aggregate: (gpu labels) + username -> total mem, process count, sm_util
+    user_agg: dict[tuple, dict] = defaultdict(lambda: {"mem": 0.0, "count": 0, "sm_util": 0.0})
     for proc in snap.processes:
         key = (proc["gpu"], proc["UUID"], proc["device"], proc["modelName"],
                proc["Hostname"], proc["DCGM_FI_DRIVER_VERSION"], proc["username"])
-        user_agg[key]["mem"]   += proc["_mem_mib"]
-        user_agg[key]["count"] += 1
+        user_agg[key]["mem"]     += proc["_mem_mib"]
+        user_agg[key]["count"]   += 1
+        user_agg[key]["sm_util"] = min(100.0, user_agg[key]["sm_util"] + proc["_sm_util"])
 
     lines.append("# HELP DCGM_FI_USER_FB_USED Per-user total framebuffer memory used across all processes on a GPU (in MiB).")
     lines.append("# TYPE DCGM_FI_USER_FB_USED gauge")
@@ -292,6 +392,17 @@ def render_metrics(snap: GpuSnapshot) -> str:
             "Hostname": host, "DCGM_FI_DRIVER_VERSION": drv, "username": username,
         }
         lines.append(f"DCGM_FI_USER_PROC_COUNT{_labels_str(lbl)} {agg['count']}")
+    lines.append("")
+
+    lines.append("# HELP DCGM_FI_USER_SM_UTIL Per-user SM utilization activity index — sum of per-process SM util capped at 100. Not a true aggregate; use as an activity indicator only.")
+    lines.append("# TYPE DCGM_FI_USER_SM_UTIL gauge")
+    for key, agg in user_agg.items():
+        gpu, uuid, device, model, host, drv, username = key
+        lbl = {
+            "gpu": gpu, "UUID": uuid, "device": device, "modelName": model,
+            "Hostname": host, "DCGM_FI_DRIVER_VERSION": drv, "username": username,
+        }
+        lines.append(f"DCGM_FI_USER_SM_UTIL{_labels_str(lbl)} {agg['sm_util']}")
     lines.append("")
 
     return "\n".join(lines)
@@ -321,37 +432,25 @@ _cache = MetricsCache()
 
 def _check_divergence(snap: GpuSnapshot):
     """
-    Compare our per-process memory sum against DCGM's GPU-level total.
-    Logs a warning if they diverge by more than 5% — helps catch stale caches
-    or processes we failed to read from /proc.
+    Compare per-process memory sum against the GPU-level FB used from the XML.
+    Only logs when the two diverge by more than 5% AND more than 100 MiB —
+    helps catch stale caches or processes missed in /proc without steady-state noise.
+
+    Uses data already collected in snap.gpu_fb_used_mib (no extra nvidia-smi call).
     """
-    # Sum process memory per GPU from our snapshot
     proc_sum: dict[str, float] = defaultdict(float)
     for proc in snap.processes:
         proc_sum[proc["gpu"]] += proc["_mem_mib"]
 
-    # Fetch DCGM FB_USED for comparison
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10
-        )
-        for line in result.stdout.strip().splitlines():
-            parts = line.split(",")
-            if len(parts) != 2:
-                continue
-            gpu_idx  = parts[0].strip()
-            dcgm_mib = float(parts[1].strip())
-            our_mib  = proc_sum.get(gpu_idx, 0.0)
-            diff     = abs(dcgm_mib - our_mib)
-            pct      = (diff / dcgm_mib * 100) if dcgm_mib > 0 else 0
-            # Only flag if both the absolute diff AND percentage are large.
-            # Small absolute diffs on idle GPUs are normal driver/CUDA context overhead.
-            flag     = " *** DIVERGED" if (pct > 5 and diff > 100) else ""
-            print(f"[CHECK] GPU {gpu_idx}: dcgm={dcgm_mib:.0f} MiB  "
-                  f"proc_sum={our_mib:.0f} MiB  diff={diff:.0f} MiB ({pct:.1f}%){flag}")
-    except Exception as exc:
-        print(f"[CHECK] divergence check failed: {exc}")
+    for gpu_idx, gpu_mib in snap.gpu_fb_used_mib.items():
+        our_mib = proc_sum.get(gpu_idx, 0.0)
+        diff    = abs(gpu_mib - our_mib)
+        pct     = (diff / gpu_mib * 100) if gpu_mib > 0 else 0
+        # Only flag if both the absolute diff AND percentage are large.
+        # Small absolute diffs are normal CUDA context / driver overhead.
+        if pct > 5 and diff > 100:
+            print(f"[CHECK] GPU {gpu_idx}: xml={gpu_mib:.0f} MiB  "
+                  f"proc_sum={our_mib:.0f} MiB  diff={diff:.0f} MiB ({pct:.1f}%)  *** DIVERGED")
 
 
 def scrape_loop():
@@ -365,7 +464,7 @@ def scrape_loop():
             elapsed = time.monotonic() - start
             print(f"[INFO] scrape {status} in {elapsed:.2f}s — "
                   f"{len(snap.gpus)} GPU(s), {len(snap.processes)} process(es)")
-            if snap.scrape_ok:
+            if snap.scrape_ok and ENABLE_DIVERGENCE_CHECK:
                 _check_divergence(snap)
         except Exception as exc:
             print(f"[ERROR] scrape loop exception: {exc}")
